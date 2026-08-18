@@ -40,8 +40,10 @@ def get_secret(name):
     # Streamlit Cloud
     try:
         value = st.secrets.get(name)
+
         if value:
             return value
+
     except Exception:
         pass
 
@@ -261,7 +263,7 @@ Requested topic:
 Study material:
 {context}
 
-Create up to {number_of_questions} questions.
+Create exactly {number_of_questions} questions.
 
 STRICT RULES:
 
@@ -274,7 +276,6 @@ STRICT RULES:
 - The correct answer must be supported by the study material.
 - The explanation must support the selected answer.
 - Do not create unrelated questions.
-- If there is not enough information, create fewer questions.
 - Never invent facts.
 
 Return ONLY valid JSON.
@@ -314,21 +315,32 @@ Requested topic:
 Study material:
 {context}
 
-Create up to {number_of_questions} multiple-choice questions.
+Create EXACTLY {number_of_questions} DIFFERENT
+multiple-choice questions.
 
 STRICT RULES:
 
 - Use ONLY the study material.
 - Questions must be about the requested topic.
 - Do not use outside knowledge.
+- Do not invent facts.
 - Each question must have exactly four options.
 - Options must be A, B, C, and D.
 - There must be exactly one correct answer.
 - The answer must be A, B, C, or D.
 - The explanation must support the correct answer.
+- Every question must test a different fact, concept, definition,
+  property, example, or detail from the study material.
+- Do not repeat or rephrase the same question.
 - Do not create unrelated questions.
-- If there is not enough information, create fewer questions.
-- Never invent facts.
+
+IMPORTANT:
+
+You MUST return exactly the requested number of questions
+whenever the study material contains enough information.
+
+If you previously generated questions, the new questions
+must be different from them.
 
 Return ONLY valid JSON.
 
@@ -351,6 +363,329 @@ Use exactly this structure:
 }}
 """
 )
+
+
+# ============================================================
+# QUIZ QUESTION VALIDATION
+# ============================================================
+
+def validate_question(item):
+    """
+    Validate a single generated quiz question.
+
+    Returns the cleaned question if valid.
+    Otherwise returns None.
+    """
+
+    if not isinstance(item, dict):
+        return None
+
+    question_text = item.get("question")
+
+    options = item.get("options")
+
+    correct_answer = item.get("answer")
+
+    explanation = item.get("explanation")
+
+    required_options = {
+        "A",
+        "B",
+        "C",
+        "D",
+    }
+
+    # --------------------------------------------------------
+    # Question text
+    # --------------------------------------------------------
+
+    if not isinstance(question_text, str):
+        return None
+
+    question_text = question_text.strip()
+
+    if not question_text:
+        return None
+
+    # --------------------------------------------------------
+    # Options
+    # --------------------------------------------------------
+
+    if not isinstance(options, dict):
+        return None
+
+    if set(options.keys()) != required_options:
+        return None
+
+    for letter in required_options:
+
+        option = options.get(letter)
+
+        if not isinstance(option, str):
+            return None
+
+        if not option.strip():
+            return None
+
+    # --------------------------------------------------------
+    # Correct answer
+    # --------------------------------------------------------
+
+    if not isinstance(correct_answer, str):
+        return None
+
+    correct_answer = (
+        correct_answer
+        .strip()
+        .upper()
+    )
+
+    if correct_answer not in required_options:
+        return None
+
+    # --------------------------------------------------------
+    # Explanation
+    # --------------------------------------------------------
+
+    if not isinstance(explanation, str):
+        return None
+
+    explanation = explanation.strip()
+
+    if not explanation:
+        return None
+
+    # --------------------------------------------------------
+    # Clean question
+    # --------------------------------------------------------
+
+    item["question"] = question_text
+
+    item["answer"] = correct_answer
+
+    item["explanation"] = explanation
+
+    item["options"] = {
+        "A": options["A"].strip(),
+        "B": options["B"].strip(),
+        "C": options["C"].strip(),
+        "D": options["D"].strip(),
+    }
+
+    return item
+
+
+# ============================================================
+# NORMALIZE QUESTION FOR DUPLICATE CHECKING
+# ============================================================
+
+def normalize_question(text):
+    """
+    Normalize question text so duplicate questions
+    can be detected.
+    """
+
+    return " ".join(
+        text
+        .strip()
+        .lower()
+        .split()
+    )
+
+
+# ============================================================
+# GENERATE QUIZ QUESTIONS WITH RETRY
+# ============================================================
+
+def generate_questions_with_retry(
+    llm,
+    prompt_template,
+    context,
+    question,
+    number_of_questions,
+    max_attempts=5,
+):
+    """
+    Generate the requested number of valid questions.
+
+    The function:
+
+    1. Requests questions from the LLM.
+    2. Validates every question.
+    3. Removes duplicates.
+    4. Requests additional questions if needed.
+    5. Continues until the requested count is reached
+       or the maximum number of attempts is exhausted.
+    """
+
+    valid_questions = []
+
+    existing_question_keys = set()
+
+    for attempt in range(max_attempts):
+
+        remaining = (
+            number_of_questions
+            - len(valid_questions)
+        )
+
+        if remaining <= 0:
+            break
+
+        # ----------------------------------------------------
+        # Ask for extra questions when previous attempts
+        # did not produce enough valid questions.
+        # ----------------------------------------------------
+
+        request_count = remaining
+
+        # On retry, request extra candidates.
+        if attempt > 0:
+            request_count = min(
+                remaining + 2,
+                10
+            )
+
+        # ----------------------------------------------------
+        # Build prompt
+        # ----------------------------------------------------
+
+        prompt_message = prompt_template.invoke(
+            {
+                "context": context,
+                "question": question,
+                "number_of_questions": request_count,
+            }
+        )
+
+        # ----------------------------------------------------
+        # Call LLM
+        # ----------------------------------------------------
+
+        try:
+
+            response = llm.invoke(
+                prompt_message
+            )
+
+        except Exception as error:
+
+            if attempt == max_attempts - 1:
+                raise error
+
+            continue
+
+        # ----------------------------------------------------
+        # Extract response
+        # ----------------------------------------------------
+
+        raw_content = response.content
+
+        if isinstance(
+            raw_content,
+            list
+        ):
+
+            raw_content = "".join(
+                str(part)
+                for part in raw_content
+            )
+
+        if not isinstance(
+            raw_content,
+            str
+        ):
+
+            raw_content = str(
+                raw_content
+            )
+
+        # ----------------------------------------------------
+        # Parse JSON
+        # ----------------------------------------------------
+
+        try:
+
+            data = json.loads(
+                raw_content
+            )
+
+        except json.JSONDecodeError:
+
+            continue
+
+        if not isinstance(
+            data,
+            dict
+        ):
+
+            continue
+
+        questions = data.get(
+            "questions",
+            []
+        )
+
+        if not isinstance(
+            questions,
+            list
+        ):
+
+            continue
+
+        # ----------------------------------------------------
+        # Validate generated questions
+        # ----------------------------------------------------
+
+        for item in questions:
+
+            cleaned_question = validate_question(
+                item
+            )
+
+            if cleaned_question is None:
+                continue
+
+            normalized = normalize_question(
+                cleaned_question["question"]
+            )
+
+            # ------------------------------------------------
+            # Prevent duplicate questions
+            # ------------------------------------------------
+
+            if normalized in existing_question_keys:
+                continue
+
+            existing_question_keys.add(
+                normalized
+            )
+
+            valid_questions.append(
+                cleaned_question
+            )
+
+            # ------------------------------------------------
+            # Stop once requested count is reached
+            # ------------------------------------------------
+
+            if len(valid_questions) >= number_of_questions:
+                break
+
+        # ----------------------------------------------------
+        # Check if complete
+        # ----------------------------------------------------
+
+        if len(valid_questions) >= number_of_questions:
+            break
+
+    # --------------------------------------------------------
+    # Return only requested number
+    # --------------------------------------------------------
+
+    return valid_questions[
+        :number_of_questions
+    ]
 
 
 # ============================================================
@@ -388,7 +723,9 @@ if "quiz_topic" not in st.session_state:
 
 with st.sidebar:
 
-    st.markdown("## 📚 AI Study Assistant")
+    st.markdown(
+        "## 📚 AI Study Assistant"
+    )
 
     st.caption(
         "Upload your study material and choose a learning mode."
@@ -400,16 +737,21 @@ with st.sidebar:
     # PDF UPLOAD
     # --------------------------------------------------------
 
-    st.markdown("### 📄 Study Material")
+    st.markdown(
+        "### 📄 Study Material"
+    )
 
     uploaded_file = st.file_uploader(
         "Upload your study PDF",
         type=["pdf"],
-        help="Upload a PDF containing your study material."
+        help="Upload a PDF containing your study material.",
     )
 
     if uploaded_file is not None:
-        st.success(uploaded_file.name)
+
+        st.success(
+            uploaded_file.name
+        )
 
     st.divider()
 
@@ -417,7 +759,9 @@ with st.sidebar:
     # STUDY MODE
     # --------------------------------------------------------
 
-    st.markdown("### 🎯 Study Mode")
+    st.markdown(
+        "### 🎯 Study Mode"
+    )
 
     mode = st.selectbox(
         "Choose a mode",
@@ -427,7 +771,7 @@ with st.sidebar:
             "Summarize",
             "Generate MCQs",
             "Take a Quiz",
-        ]
+        ],
     )
 
     # --------------------------------------------------------
@@ -438,14 +782,14 @@ with st.sidebar:
 
     if mode in {
         "Generate MCQs",
-        "Take a Quiz"
+        "Take a Quiz",
     }:
 
         number_of_questions = st.slider(
             "Number of questions",
             min_value=1,
             max_value=10,
-            value=5
+            value=5,
         )
 
     st.divider()
@@ -504,12 +848,12 @@ upload_dir = "uploads"
 
 os.makedirs(
     upload_dir,
-    exist_ok=True
+    exist_ok=True,
 )
 
 pdf_path = os.path.join(
     upload_dir,
-    uploaded_file.name
+    uploaded_file.name,
 )
 
 
@@ -520,7 +864,7 @@ if (
 
     with open(
         pdf_path,
-        "wb"
+        "wb",
     ) as file:
 
         file.write(
@@ -563,9 +907,13 @@ if (
             # Reset quiz
 
             st.session_state.quiz_data = None
+
             st.session_state.quiz_index = 0
+
             st.session_state.quiz_score = 0
+
             st.session_state.quiz_finished = False
+
             st.session_state.quiz_topic = None
 
         except Exception as error:
@@ -582,7 +930,7 @@ else:
 
     index_result = {
         "status": "existing",
-        "chunks": engine.collection.count()
+        "chunks": engine.collection.count(),
     }
 
 
@@ -635,7 +983,7 @@ st.markdown(
 question = st.text_input(
     "Enter your question or topic",
     placeholder="Example: What is a variable?",
-    label_visibility="collapsed"
+    label_visibility="collapsed",
 )
 
 
@@ -652,7 +1000,7 @@ button_text = (
 generate_clicked = st.button(
     button_text,
     type="primary",
-    use_container_width=True
+    use_container_width=True,
 )
 
 
@@ -682,7 +1030,7 @@ if generate_clicked:
 
                 retrieval = engine.retrieve(
                     question,
-                    n_results=3
+                    n_results=3,
                 )
 
             except Exception as error:
@@ -692,7 +1040,6 @@ if generate_clicked:
                 )
 
                 st.stop()
-
 
         # ----------------------------------------------------
         # CHECK RETRIEVAL
@@ -711,23 +1058,11 @@ if generate_clicked:
                 retrieval["chunks"]
             )
 
-
             # =================================================
             # TAKE QUIZ
             # =================================================
 
             if mode == "Take a Quiz":
-
-                quiz_prompt_message = (
-                    quiz_prompt.invoke(
-                        {
-                            "context": context,
-                            "question": question,
-                            "number_of_questions":
-                                number_of_questions
-                        }
-                    )
-                )
 
                 with st.spinner(
                     "Creating your quiz..."
@@ -735,34 +1070,16 @@ if generate_clicked:
 
                     try:
 
-                        response = quiz_llm.invoke(
-                            quiz_prompt_message
-                        )
-
-                        raw_content = response.content
-
-                        if isinstance(
-                            raw_content,
-                            list
-                        ):
-
-                            raw_content = "".join(
-                                str(part)
-                                for part in raw_content
+                        valid_questions = (
+                            generate_questions_with_retry(
+                                llm=quiz_llm,
+                                prompt_template=quiz_prompt,
+                                context=context,
+                                question=question,
+                                number_of_questions=number_of_questions,
+                                max_attempts=5,
                             )
-
-                        quiz_data = json.loads(
-                            raw_content
                         )
-
-                    except json.JSONDecodeError:
-
-                        st.error(
-                            "The quiz response was not valid JSON. "
-                            "Please try again."
-                        )
-
-                        st.stop()
 
                     except Exception as error:
 
@@ -772,94 +1089,9 @@ if generate_clicked:
 
                         st.stop()
 
-
-                questions = quiz_data.get(
-                    "questions",
-                    []
-                )
-
-
                 # ------------------------------------------------
-                # VALIDATE QUIZ QUESTIONS
+                # CHECK QUESTION COUNT
                 # ------------------------------------------------
-
-                valid_questions = []
-
-                for item in questions:
-
-                    if not isinstance(
-                        item,
-                        dict
-                    ):
-                        continue
-
-                    question_text = item.get(
-                        "question"
-                    )
-
-                    options = item.get(
-                        "options"
-                    )
-
-                    correct_answer = item.get(
-                        "answer"
-                    )
-
-                    explanation = item.get(
-                        "explanation"
-                    )
-
-                    required_options = {
-                        "A",
-                        "B",
-                        "C",
-                        "D"
-                    }
-
-                    if not question_text:
-                        continue
-
-                    if not isinstance(
-                        options,
-                        dict
-                    ):
-                        continue
-
-                    if not required_options.issubset(
-                        options.keys()
-                    ):
-                        continue
-
-                    if not all(
-                        options.get(letter)
-                        for letter in required_options
-                    ):
-                        continue
-
-                    if not isinstance(
-                        correct_answer,
-                        str
-                    ):
-                        continue
-
-                    correct_answer = (
-                        correct_answer
-                        .strip()
-                        .upper()
-                    )
-
-                    if correct_answer not in required_options:
-                        continue
-
-                    if not explanation:
-                        continue
-
-                    item["answer"] = correct_answer
-
-                    valid_questions.append(
-                        item
-                    )
-
 
                 if not valid_questions:
 
@@ -869,13 +1101,29 @@ if generate_clicked:
 
                     st.stop()
 
+                # ------------------------------------------------
+                # IMPORTANT:
+                # If fewer questions were generated, do NOT
+                # silently start a smaller quiz.
+                # ------------------------------------------------
 
-                valid_questions = (
-                    valid_questions[
-                        :number_of_questions
-                    ]
-                )
+                if len(valid_questions) < number_of_questions:
 
+                    st.error(
+                        f"Could generate only "
+                        f"{len(valid_questions)} valid questions "
+                        f"out of the requested "
+                        f"{number_of_questions}."
+                    )
+
+                    st.info(
+                        "The uploaded study material may not contain "
+                        "enough distinct information for the requested "
+                        "number of questions. Try a broader topic or "
+                        "a smaller number of questions."
+                    )
+
+                    st.stop()
 
                 # ------------------------------------------------
                 # STORE QUIZ
@@ -886,12 +1134,14 @@ if generate_clicked:
                 )
 
                 st.session_state.quiz_index = 0
+
                 st.session_state.quiz_score = 0
+
                 st.session_state.quiz_finished = False
+
                 st.session_state.quiz_topic = question
 
                 st.rerun()
-
 
             # =================================================
             # GENERATE MCQs
@@ -905,7 +1155,7 @@ if generate_clicked:
                             "context": context,
                             "question": question,
                             "number_of_questions":
-                                number_of_questions
+                                number_of_questions,
                         }
                     )
                 )
@@ -924,7 +1174,7 @@ if generate_clicked:
 
                         if isinstance(
                             raw_content,
-                            list
+                            list,
                         ):
 
                             raw_content = "".join(
@@ -953,12 +1203,10 @@ if generate_clicked:
 
                         st.stop()
 
-
                 questions = mcq_data.get(
                     "questions",
-                    []
+                    [],
                 )
-
 
                 # ------------------------------------------------
                 # VALIDATE MCQs
@@ -966,81 +1214,37 @@ if generate_clicked:
 
                 valid_questions = []
 
+                seen_questions = set()
+
                 for item in questions:
 
-                    if not isinstance(
-                        item,
-                        dict
-                    ):
-                        continue
-
-                    question_text = item.get(
-                        "question"
-                    )
-
-                    options = item.get(
-                        "options"
-                    )
-
-                    correct_answer = item.get(
-                        "answer"
-                    )
-
-                    explanation = item.get(
-                        "explanation"
-                    )
-
-                    required_options = {
-                        "A",
-                        "B",
-                        "C",
-                        "D"
-                    }
-
-                    if not question_text:
-                        continue
-
-                    if not isinstance(
-                        options,
-                        dict
-                    ):
-                        continue
-
-                    if not required_options.issubset(
-                        options.keys()
-                    ):
-                        continue
-
-                    if not all(
-                        options.get(letter)
-                        for letter in required_options
-                    ):
-                        continue
-
-                    if not isinstance(
-                        correct_answer,
-                        str
-                    ):
-                        continue
-
-                    correct_answer = (
-                        correct_answer
-                        .strip()
-                        .upper()
-                    )
-
-                    if correct_answer not in required_options:
-                        continue
-
-                    if not explanation:
-                        continue
-
-                    item["answer"] = correct_answer
-
-                    valid_questions.append(
+                    cleaned_question = validate_question(
                         item
                     )
 
+                    if cleaned_question is None:
+                        continue
+
+                    normalized = normalize_question(
+                        cleaned_question["question"]
+                    )
+
+                    if normalized in seen_questions:
+                        continue
+
+                    seen_questions.add(
+                        normalized
+                    )
+
+                    valid_questions.append(
+                        cleaned_question
+                    )
+
+                    if (
+                        len(valid_questions)
+                        >= number_of_questions
+                    ):
+                        break
 
                 if not valid_questions:
 
@@ -1050,14 +1254,6 @@ if generate_clicked:
                     )
 
                     st.stop()
-
-
-                valid_questions = (
-                    valid_questions[
-                        :number_of_questions
-                    ]
-                )
-
 
                 # ------------------------------------------------
                 # DISPLAY MCQs
@@ -1069,7 +1265,7 @@ if generate_clicked:
 
                 for index, item in enumerate(
                     valid_questions,
-                    start=1
+                    start=1,
                 ):
 
                     with st.container(
@@ -1111,9 +1307,8 @@ if generate_clicked:
 
                             st.write(
                                 "Explanation:",
-                                item["explanation"]
+                                item["explanation"],
                             )
-
 
             # =================================================
             # NORMAL MODES
@@ -1127,7 +1322,7 @@ if generate_clicked:
                         question_prompt.invoke(
                             {
                                 "context": context,
-                                "question": question
+                                "question": question,
                             }
                         )
                     )
@@ -1138,7 +1333,7 @@ if generate_clicked:
                         explain_prompt.invoke(
                             {
                                 "context": context,
-                                "question": question
+                                "question": question,
                             }
                         )
                     )
@@ -1149,11 +1344,10 @@ if generate_clicked:
                         summary_prompt.invoke(
                             {
                                 "context": context,
-                                "question": question
+                                "question": question,
                             }
                         )
                     )
-
 
                 with st.spinner(
                     "Generating answer..."
@@ -1171,20 +1365,14 @@ if generate_clicked:
 
                         error_text = str(error)
 
-                        if (
-                            "401"
-                            in error_text
-                        ):
+                        if "401" in error_text:
 
                             st.error(
                                 "Ollama authentication failed. "
                                 "Please check your OLLAMA_API_KEY."
                             )
 
-                        elif (
-                            "403"
-                            in error_text
-                        ):
+                        elif "403" in error_text:
 
                             st.error(
                                 "Ollama denied access to the model. "
@@ -1200,7 +1388,6 @@ if generate_clicked:
                             )
 
                         st.stop()
-
 
                 # ------------------------------------------------
                 # DISPLAY ANSWER
@@ -1218,7 +1405,6 @@ if generate_clicked:
                         answer
                     )
 
-
             # =================================================
             # SOURCE CONTEXT
             # =================================================
@@ -1229,7 +1415,7 @@ if generate_clicked:
 
                 for index, chunk in enumerate(
                     retrieval["chunks"],
-                    start=1
+                    start=1,
                 ):
 
                     st.markdown(
@@ -1253,42 +1439,51 @@ if (
     and not st.session_state.quiz_finished
 ):
 
-    questions = st.session_state.quiz_data
+    questions = (
+        st.session_state.quiz_data
+    )
 
     current_index = (
         st.session_state.quiz_index
     )
 
+    # --------------------------------------------------------
+    # Safety check
+    # --------------------------------------------------------
+
+    if current_index >= len(questions):
+
+        st.session_state.quiz_finished = True
+
+        st.rerun()
+
     current_question = (
         questions[current_index]
     )
 
-
     st.divider()
-
 
     # ========================================================
     # PROGRESS
     # ========================================================
 
     st.progress(
-        (current_index + 1) / len(questions)
+        (current_index + 1)
+        / len(questions)
     )
-
 
     st.markdown(
         f"### 📝 Question {current_index + 1} "
         f"of {len(questions)}"
     )
 
-
     st.write(
         current_question["question"]
     )
 
-
-    options = current_question["options"]
-
+    options = (
+        current_question["options"]
+    )
 
     answer = st.radio(
         "Choose your answer:",
@@ -1296,17 +1491,16 @@ if (
             f"A. {options['A']}",
             f"B. {options['B']}",
             f"C. {options['C']}",
-            f"D. {options['D']}"
+            f"D. {options['D']}",
         ],
-        key=f"quiz_answer_{current_index}"
+        key=f"quiz_answer_{current_index}",
     )
-
 
     if st.button(
         "Submit Answer",
         type="primary",
         key=f"submit_quiz_{current_index}",
-        use_container_width=True
+        use_container_width=True,
     ):
 
         student_answer = (
@@ -1320,7 +1514,6 @@ if (
             .strip()
             .upper()
         )
-
 
         if student_answer == correct_answer:
 
@@ -1342,9 +1535,8 @@ if (
 
             st.write(
                 "Explanation:",
-                current_question["explanation"]
+                current_question["explanation"],
             )
-
 
         # ----------------------------------------------------
         # MOVE TO NEXT QUESTION
@@ -1361,7 +1553,6 @@ if (
 
             st.session_state.quiz_index += 1
 
-
         st.rerun()
 
 
@@ -1375,12 +1566,15 @@ if (
     and st.session_state.quiz_finished
 ):
 
-    questions = st.session_state.quiz_data
+    questions = (
+        st.session_state.quiz_data
+    )
 
     total = len(questions)
 
-    score = st.session_state.quiz_score
-
+    score = (
+        st.session_state.quiz_score
+    )
 
     if total > 0:
 
@@ -1392,35 +1586,29 @@ if (
 
         percentage = 0
 
-
     st.divider()
-
 
     st.markdown(
         "### 🎯 Quiz Result"
     )
 
-
     result_col1, result_col2 = st.columns(
         2
     )
-
 
     with result_col1:
 
         st.metric(
             "Score",
-            f"{score}/{total}"
+            f"{score}/{total}",
         )
-
 
     with result_col2:
 
         st.metric(
             "Percentage",
-            f"{percentage:.1f}%"
+            f"{percentage:.1f}%",
         )
-
 
     if percentage >= 80:
 
@@ -1440,20 +1628,23 @@ if (
             "Keep practicing and review the material. 📚"
         )
 
-
     # ========================================================
     # NEW QUIZ
     # ========================================================
 
     if st.button(
         "Start New Quiz",
-        use_container_width=True
+        use_container_width=True,
     ):
 
         st.session_state.quiz_data = None
+
         st.session_state.quiz_index = 0
+
         st.session_state.quiz_score = 0
+
         st.session_state.quiz_finished = False
+
         st.session_state.quiz_topic = None
 
         st.rerun()
