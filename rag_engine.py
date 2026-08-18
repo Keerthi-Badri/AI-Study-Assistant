@@ -3,19 +3,21 @@ import os
 
 import chromadb
 import pymupdf
-from langchain_text_splitters import RecursiveCharacterTextSplitter 
 import streamlit as st
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
 
 CHROMA_PATH = "./chroma_db"
 DISTANCE_THRESHOLD = 1.2
 
+
 @st.cache_resource
 def load_embedding_model():
     return SentenceTransformer(
         "sentence-transformers/all-MiniLM-L6-v2"
     )
+
 
 class RAGEngine:
 
@@ -42,6 +44,7 @@ class RAGEngine:
 
         # Load embedding model
         self.embedding_model = load_embedding_model()
+
         # Open persistent Chroma
         self.client = chromadb.PersistentClient(
             path=CHROMA_PATH
@@ -66,6 +69,8 @@ class RAGEngine:
             }
 
         pdf = pymupdf.open(self.pdf_file)
+
+        page_count = len(pdf)
 
         all_text = ""
 
@@ -112,7 +117,7 @@ class RAGEngine:
         return {
             "status": "indexed",
             "chunks": len(chunks),
-            "pages": len(pdf)
+            "pages": page_count
         }
 
     def retrieve(

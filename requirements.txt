@@ -6,3 +6,5 @@ langchain-text-splitters
 chromadb
 pymupdf
 sentence-transformers
+python-dotenv
+ollama
